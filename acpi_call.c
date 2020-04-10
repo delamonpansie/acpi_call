@@ -40,8 +40,15 @@ static u8 temporary_buffer[BUFFER_SIZE];
 static size_t get_avail_bytes(void) {
     return BUFFER_SIZE - strlen(result_buffer);
 }
-static char *get_buffer_end(void) {
-    return result_buffer + strlen(result_buffer);
+
+/* FIXME: remove global buffer */
+static void print(const char *fmt, ...)
+{
+    va_list va;
+    int len = strlen(result_buffer);
+    va_start(va, fmt);
+    vsnprintf(result_buffer + len, BUFFER_SIZE - len - 1, fmt, va);
+    va_end(va);
 }
 
 /** Appends the contents of an acpi_object to the result buffer
@@ -50,46 +57,42 @@ static char *get_buffer_end(void) {
 */
 static int acpi_result_to_string(union acpi_object *result) {
     if (result->type == ACPI_TYPE_INTEGER) {
-        snprintf(get_buffer_end(), get_avail_bytes(),
-            "0x%x", (int)result->integer.value);
+        print( "0x%x", (int)result->integer.value);
     } else if (result->type == ACPI_TYPE_STRING) {
-        snprintf(get_buffer_end(), get_avail_bytes(),
-            "\"%*s\"", result->string.length, result->string.pointer);
+        print("\"%*s\"", result->string.length, result->string.pointer);
     } else if (result->type == ACPI_TYPE_BUFFER) {
         int i;
         // do not store more than data if it does not fit. The first element is
         // just 4 chars, but there is also two bytes from the curly brackets
         int show_values = min((size_t)result->buffer.length, get_avail_bytes() / 6);
 
-        snprintf(get_buffer_end(), get_avail_bytes(), "{");
+        print("{");
         for (i = 0; i < show_values; i++)
-            sprintf(get_buffer_end(),
-                i == 0 ? "0x%02x" : ", 0x%02x", result->buffer.pointer[i]);
+            print(i == 0 ? "0x%02x" : ", 0x%02x", result->buffer.pointer[i]);
 
         if (result->buffer.length > show_values) {
             // if data was truncated, show a trailing comma if there is space
-            snprintf(get_buffer_end(), get_avail_bytes(), ",");
+            print(",");
             return 1;
         } else {
             // in case show_values == 0, but the buffer is too small to hold
             // more values (i.e. the buffer cannot have anything more than "{")
-            snprintf(get_buffer_end(), get_avail_bytes(), "}");
+            print("}");
         }
     } else if (result->type == ACPI_TYPE_PACKAGE) {
         int i;
-        snprintf(get_buffer_end(), get_avail_bytes(), "[");
+        print("[");
         for (i=0; i<result->package.count; i++) {
             if (i > 0)
-                snprintf(get_buffer_end(), get_avail_bytes(), ", ");
+                print(", ");
 
             // abort if there is no more space available
             if (!get_avail_bytes() || acpi_result_to_string(&result->package.elements[i]))
                 return 1;
         }
-        snprintf(get_buffer_end(), get_avail_bytes(), "]");
+        print("]");
     } else {
-        snprintf(get_buffer_end(), get_avail_bytes(),
-            "Object type 0x%x\n", result->type);
+        print("Object type 0x%x\n", result->type);
     }
 
     // return 0 if there are still bytes available, 1 otherwise
@@ -113,12 +116,11 @@ static void do_acpi_call(const char * method, int argc, union acpi_object *argv)
 #endif
 
     // get the handle of the method, must be a fully qualified path
-    status = acpi_get_handle(NULL, (acpi_string) method, &handle);
+    status = acpi_get_handle(NULL, (acpi_string)method, &handle);
 
-    if (ACPI_FAILURE(status))
-    {
-        snprintf(result_buffer, BUFFER_SIZE, "Error: %s", acpi_format_exception(status));
-        printk(KERN_ERR "acpi_call: Cannot get handle: %s\n", result_buffer);
+    if (ACPI_FAILURE(status)) {
+        printk(KERN_ERR "acpi_call: Cannot get handle: %s\n",
+               acpi_format_exception(status));
         return;
     }
 
@@ -128,20 +130,20 @@ static void do_acpi_call(const char * method, int argc, union acpi_object *argv)
 
     // call the method
     status = acpi_evaluate_object(handle, NULL, &arg, &buffer);
-    if (ACPI_FAILURE(status))
-    {
-        snprintf(result_buffer, BUFFER_SIZE, "Error: %s", acpi_format_exception(status));
-        printk(KERN_ERR "acpi_call: Method call failed: %s\n", result_buffer);
+    if (ACPI_FAILURE(status)) {
+        printk(KERN_ERR "acpi_call: Method call failed: %s\n",
+               acpi_format_exception(status));
         return;
     }
 
     // reset the result buffer
-    *result_buffer = '\0';
+    memset(result_buffer, 0, sizeof(result_buffer));
     acpi_result_to_string(buffer.pointer);
+    print("\n"); // FIXME: надо удостовериться, что место всегда есть
     kfree(buffer.pointer);
 
 #ifdef DEBUG
-    printk(KERN_INFO "acpi_call: Call successful: %s\n", result_buffer);
+    printk(KERN_INFO "acpi_call: Call successful: %s", result_buffer);
 #endif
 }
 
@@ -302,6 +304,8 @@ static int acpi_proc_write( struct file *filp, const char __user *buff,
     int nargs, i;
     char *method;
 
+    strcpy(result_buffer, "not called\n");
+
     if (len > sizeof(input) - 1) {
         printk(KERN_ERR "acpi_call: Input too long! (%lu)\n", len);
         return -ENOSPC;
@@ -338,16 +342,9 @@ Returns the last call status:
 static ssize_t acpi_proc_read( struct file *filp, char __user *buff,
             size_t count, loff_t *off )
 {
-    ssize_t ret;
-    int len = strlen(result_buffer);
-
     // output the current result buffer
-    ret = simple_read_from_buffer(buff, count, off, result_buffer, len + 1);
-
-    // initialize the result buffer for later
-    strcpy(result_buffer, "not called");
-
-    return ret;
+    int len = strlen(result_buffer);
+    return simple_read_from_buffer(buff, count, off, result_buffer, len + 1);
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
@@ -378,9 +375,6 @@ static int acpi_proc_read(char *page, char **start, off_t off,
     len = strlen(result_buffer);
     memcpy(page, result_buffer, len + 1);
 
-    // initialize the result buffer for later
-    strcpy(result_buffer, "not called");
-
     return len;
 }
 #endif
@@ -397,7 +391,7 @@ static int __init init_acpi_call(void)
     struct proc_dir_entry *acpi_entry = create_proc_entry("call", 0660, acpi_root_dir);
 #endif
 
-    strcpy(result_buffer, "not called");
+    strcpy(result_buffer, "not called\n");
 
     if (acpi_entry == NULL) {
       printk(KERN_ERR "acpi_call: Couldn't create proc entry\n");
@@ -429,3 +423,6 @@ module_init(init_acpi_call);
 module_exit(unload_acpi_call);
 
 
+/* Local Variables: */
+/* c-basic-offset: 4 */
+/* End: */
